@@ -204,7 +204,6 @@ CramfsFile::CramfsInode* CramfsFile::SearchFile(const char* fullpath) const
         CramfsInode* pnode = (CramfsInode*)&root;
         const char* name_start = fullpath + 1;
         const char* next_split = strchr(name_start, '/');
-        bool exists = false;
         char name[256];
         int namelen;
 
@@ -263,134 +262,10 @@ bool CramfsFile::Exists(const char* path) const
     return false;
 }
 
-static char outbuffer[PAGE_SIZE*2];
-static z_stream stream;
 #define ROMBUFFER_BITS	13
 #define ROMBUFFERSIZE	(1 << ROMBUFFER_BITS)
 #define ROMBUFFERMASK	(ROMBUFFERSIZE-1)
-static char read_buffer[ROMBUFFERSIZE * 2];
-static unsigned long read_buffer_block = ~0UL;
-/*
-static void *romfs_read(unsigned long offset)
-{
-	unsigned int block = offset >> ROMBUFFER_BITS;
-	if (block != read_buffer_block) {
-		read_buffer_block = block;
-		lseek(fd, block << ROMBUFFER_BITS, SEEK_SET);
-		read(fd, read_buffer, ROMBUFFERSIZE * 2);
-	}
-	return read_buffer + (offset & ROMBUFFERMASK);
-}
-*/
 
-static int uncompress_block(void *src, int len)
-{
-	int err;
-
-	stream.next_in = (Bytef*)src;
-	stream.avail_in = len;
-
-	stream.next_out = (unsigned char *) outbuffer;
-	stream.avail_out = PAGE_SIZE*2;
-
-	inflateReset(&stream);
-
-	if (len > PAGE_SIZE*2) {
-            return -1;
-		//die(FSCK_UNCORRECTED, 0, "data block too large");
-	}
-	err = inflate(&stream, Z_FINISH);
-	if (err != Z_STREAM_END) {
-		//die(FSCK_UNCORRECTED, 0, "decompression error %p(%d): %s",
-		//    src, len, zError(err));
-		return -1;
-	}
-	return stream.total_out;
-}
-
-
-/* Decompress from file source to file dest until stream ends or EOF.
-   inf() returns Z_OK on success, Z_MEM_ERROR if memory could not be
-   allocated for processing, Z_DATA_ERROR if the deflate data is
-   invalid or incomplete, Z_VERSION_ERROR if the version of zlib.h and
-   the version of the library linked do not match, or Z_ERRNO if there
-   is an error reading or writing the files. */
-int inf(uint8_t* buffer, size_t size, FILE *dest)
-{
-    #define CHUNK 16384
-
-    int ret;
-    unsigned have;
-    z_stream strm;
-    unsigned char in[CHUNK];
-    unsigned char out[CHUNK];
-
-    /* allocate inflate state */
-    strm.zalloc = Z_NULL;
-    strm.zfree = Z_NULL;
-    strm.opaque = Z_NULL;
-    strm.avail_in = 0;
-    strm.next_in = Z_NULL;
-    ret = inflateInit(&strm);
-    if (ret != Z_OK)
-        return ret;
-
-    /* decompress until deflate stream ends or end of file */
-    //do {
-    for(size_t i = 0; i < size; ++i)
-    {
-        strm.avail_in = CHUNK;//fread(in, 1, CHUNK, source);
-        memcpy(in, buffer, CHUNK);
-        /*if (ferror(source)) {
-            (void)inflateEnd(&strm);
-            return Z_ERRNO;
-        }
-        if (strm.avail_in == 0)
-            break;
-            */
-        strm.next_in = in;
-
-        /* run inflate() on input until output buffer not full */
-        do {
-            strm.avail_out = CHUNK;
-            strm.next_out = out;
-            ret = inflate(&strm, Z_NO_FLUSH);
-            if(ret != Z_STREAM_ERROR)  /* state not clobbered */
-            {
-                cout<<"zlib init failed."<<endl;
-                return Z_DATA_ERROR;
-            }
-            switch (ret) {
-            case Z_NEED_DICT:
-                ret = Z_DATA_ERROR;     /* and fall through */
-            case Z_DATA_ERROR:
-            case Z_MEM_ERROR:
-                (void)inflateEnd(&strm);
-                return ret;
-            }
-            have = CHUNK - strm.avail_out;
-            if (fwrite(out, 1, have, dest) != have || ferror(dest)) {
-                (void)inflateEnd(&strm);
-                return Z_ERRNO;
-            }
-        } while (strm.avail_out == 0);
-
-        /* done when inflate() says it's done */
-    } //while (ret != Z_STREAM_END);
-
-    /* clean up and return */
-    inflateEnd(&strm);
-    return ret == Z_STREAM_END ? Z_OK : Z_DATA_ERROR;
-}
-
-static bool save_file(uint8_t* buffer, size_t len, int idx)
-{
-    char name[32];
-    sprintf(name, "data_%d", idx);
-    FILE *fo = fopen(name, "wb");
-    fwrite(buffer, len, 1, fo);
-    fclose(fo);
-}
 
 /* report a zlib or i/o error */
 void zerr(int ret)
@@ -417,6 +292,57 @@ void zerr(int ret)
     }
 }
 
+int inf2(uint8_t* buffer, size_t len, uint8_t* dst, size_t avail)
+{
+    int ret;
+    unsigned have;
+    z_stream strm;
+
+
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    ret = inflateInit(&strm);
+    if (ret != Z_OK)
+        return ret;
+    /* decompress until deflate stream ends or end of file */
+    do {
+        strm.avail_in = len;
+
+        if (strm.avail_in == 0)
+            break;
+        strm.next_in = buffer;
+        uint32_t left = avail;
+        uint8_t* out = dst;
+
+        /* run inflate() on input until output buffer not full */
+        do {
+            strm.avail_out = left;
+            strm.next_out = out;
+            ret = inflate(&strm, Z_NO_FLUSH);
+            //assert(ret != Z_STREAM_ERROR);  /* state not clobbered */
+            switch (ret) {
+            case Z_NEED_DICT:
+                ret = Z_DATA_ERROR;     /* and fall through */
+            case Z_DATA_ERROR:
+            case Z_MEM_ERROR:
+                (void)inflateEnd(&strm);
+                return ret;
+            }
+            have = left - strm.avail_out;
+            left += have;
+        } while (strm.avail_out == 0);
+
+        /* done when inflate() says it's done */
+    } while (ret != Z_STREAM_END);
+
+    /* clean up and return */
+    (void)inflateEnd(&strm);
+    return ret == Z_STREAM_END ? Z_OK : Z_DATA_ERROR;
+}
+
 
 bool CramfsFile::ExtractFile(const char* path, uint8_t*& orig_data, size_t& size)
 {
@@ -426,18 +352,41 @@ bool CramfsFile::ExtractFile(const char* path, uint8_t*& orig_data, size_t& size
         size_t nblocks = (node->inode.size + PAGE_SIZE - 1) / PAGE_SIZE;
         uint32_t* block_pointers = (uint32_t*)(base_buffer + node->inode.offset * 4);
         uint32_t data_start = node->inode.offset * 4 + 4 * nblocks;
-        uint8_t* data_buffer = (uint8_t*)malloc(nblocks * PAGE_SIZE);
-        FILE* fo = fopen("test.c", "wb");
+        uint8_t* orig_data = (uint8_t*)malloc(node->inode.size);
+        if(orig_data == NULL)
+        {
+            cout<<"Allocate memory while extract file for ["<<path<<"] failed, size["<<node->inode.size<<"]."<<endl;
+            return false;
+        }
 
         uint32_t prev_offset = data_start;
         uint32_t len;
-        for(size_t i = 0; i < nblocks; ++i)
+
+        uint8_t* out = orig_data;
+        size_t i;
+        int ret;
+        for(i = 0; i < nblocks; ++i)
         {
             len = block_pointers[i] - prev_offset;
-            save_file(base_buffer + prev_offset, len, i);
-            //inf(base_buffer + prev_offset, len, fo);
+            ret = inf2(base_buffer + prev_offset, len, out, PAGE_SIZE);
+            if(ret != Z_OK)
+            {
+                break;
+            }
             prev_offset += len;
+            out += PAGE_SIZE;
         }
+        if(ret != Z_OK)
+        {
+            free(orig_data);
+            orig_data = NULL;
+            return false;
+        }
+        size = node->inode.size;
+        FILE* fo = fopen("tmp", "wb");
+        fwrite(orig_data, node->inode.size, 1, fo);
+        fclose(fo);
+        return true;
     }
     return false;
 }
